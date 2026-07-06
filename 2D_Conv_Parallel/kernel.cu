@@ -12,6 +12,8 @@
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
 
+#define FILTER_DIM 3
+
 void convolution(
 	const unsigned char* input_image,
 	unsigned char* output_image,
@@ -121,26 +123,26 @@ __global__ void convolution_kernel(
 int main() {
 
 	//FILTERS
-	float blur_filter[9] = {
+	float blur_filter[FILTER_DIM * FILTER_DIM] = {
 		1.0f / 9.0f, 1.0f / 9.0f, 1.0f / 9.0f,
 		1.0f / 9.0f, 1.0f / 9.0f, 1.0f / 9.0f,
 		1.0f / 9.0f, 1.0f / 9.0f, 1.0f / 9.0f
 	};
 
-	float edge_filter[9] = {
+	float edge_filter[FILTER_DIM * FILTER_DIM] = {
 		-1.0f, -1.0f, -1.0f,
 		-1.0f,  8.0f, -1.0f,
 		-1.0f, -1.0f, -1.0f
 	};
 
-	float sharpen_filter[9] = {
-	 0.0f, -1.0f,  0.0f,
-	-1.0f,  5.0f, -1.0f,
-	 0.0f, -1.0f,  0.0f
+	float sharpen_filter[FILTER_DIM * FILTER_DIM] = {
+		 0.0f, -1.0f,  0.0f,
+		-1.0f,  5.0f, -1.0f,
+		 0.0f, -1.0f,  0.0f
 	};
 
-	int filter_dim = 3; // 3x3 filter
 	float* filter_matrix = edge_filter; // Choose the filter to apply
+	int filter_dim = FILTER_DIM; // 3x3 filter
 
 	// =====================================================================
 	// SERIAL CPU IMPLEMENTATION OF 2D CONVOLUTION
