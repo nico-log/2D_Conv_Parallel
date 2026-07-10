@@ -18,6 +18,16 @@
 #define FILTER_RADIUS (FILTER_DIM / 2)
 #define TILE_SIZE (BLOCK_SIZE + 2 * FILTER_RADIUS)
 
+#define CUDA_CHECK(call)                                                      \
+    do {                                                                      \
+        cudaError_t err = call;                                               \
+        if (err != cudaSuccess) {                                             \
+            std::cerr << "CUDA error at " << __FILE__ << ":" << __LINE__      \
+                      << " -> " << cudaGetErrorString(err) << std::endl;      \
+            exit(EXIT_FAILURE);                                               \
+        }                                                                     \
+    } while (0)
+
 __constant__ float c_filter[FILTER_DIM*FILTER_DIM];
 
 void convolution_cpu(
@@ -70,8 +80,8 @@ void convolution_cpu(
 }
 
 __global__ void convolution_kernel(
-	unsigned char* input_image,
-	unsigned char* output_image,
+	unsigned char* __restrict__ input_image,
+	unsigned char* __restrict__ output_image,
 	int width, int height, int channels)
 {
 	// SHARED MEMORY
@@ -124,6 +134,7 @@ __global__ void convolution_kernel(
 			//filter (fy rows, fx cols)
 			#pragma unroll
 			for (int fy = -FILTER_RADIUS; fy <= FILTER_RADIUS; ++fy) {
+				#pragma unroll
 				for (int fx = -FILTER_RADIUS; fx <= FILTER_RADIUS; ++fx) {
 
 					float pixel_value = shared_tile[threadIdx.y + fy + FILTER_RADIUS][threadIdx.x + fx + FILTER_RADIUS][c];					
@@ -151,10 +162,17 @@ __global__ void convolution_kernel(
 
 int main(int argc, char** argv) {
 
-	if (argc < 3) {
+	if (argc < 4) {
 		std::cerr << "Error: missing arguments" << std::endl;
-		std::cerr << "Usage: " << argv[0] << " <filter_type> <image_path>" << std::endl;
+		std::cerr << "Usage: " << argv[0] << " <filter_type> <image_path> <iterations>" << std::endl;
 		std::cerr << "filter_type: blur, edge, sharpen" << std::endl;
+		return 1;
+	}
+
+	const int iterations = std::stoi(argv[3]);
+
+	if (iterations < 0 || iterations > 100) {
+		std::cerr << "Error: iterations must be between 0 and 100" << std::endl;
 		return 1;
 	}
 
@@ -246,46 +264,46 @@ int main(int argc, char** argv) {
 	size_t image_size = width * height * output_channels * sizeof(unsigned char);
 	size_t filter_size = FILTER_DIM * FILTER_DIM * sizeof(float);
 
-	cudaMalloc((void**)&d_input_image, image_size);
-	cudaMalloc((void**)&d_output_image, image_size);
+	CUDA_CHECK(cudaMalloc((void**)&d_input_image, image_size));
+	CUDA_CHECK(cudaMalloc((void**)&d_output_image, image_size));
 
 	// Copy input image and filter to GPU memory
-	cudaMemcpy(d_input_image, input_image, image_size, cudaMemcpyHostToDevice);
-	cudaMemcpyToSymbol(c_filter, active_filter, filter_size);
+	CUDA_CHECK(cudaMemcpy(d_input_image, input_image, image_size, cudaMemcpyHostToDevice));
+	CUDA_CHECK(cudaMemcpyToSymbol(c_filter, active_filter, filter_size));
 
 	dim3 threadsPerBlock(BLOCK_SIZE, BLOCK_SIZE); // 16 x 16 = 256 threads per block
 	dim3 numBlocks((width + threadsPerBlock.x - 1) / threadsPerBlock.x, (height + threadsPerBlock.y - 1) / threadsPerBlock.y); // Round up to the nearest block
 
 	cudaEvent_t start, stop;
-	cudaEventCreate(&start);
-	cudaEventCreate(&stop);
+	CUDA_CHECK(cudaEventCreate(&start));
+	CUDA_CHECK(cudaEventCreate(&stop));
 
 	//Warm up kernel launch to avoid measuring initialization overhead
 	convolution_kernel << <numBlocks, threadsPerBlock >> > (d_input_image, d_output_image, width, height, output_channels);
-	cudaDeviceSynchronize();
+	CUDA_CHECK(cudaGetLastError());
+	CUDA_CHECK(cudaDeviceSynchronize());
 
 	// Benchmark loop 
-	int num_iterations = 100;
+	CUDA_CHECK(cudaEventRecord(start));
 
-	// Initialize output image on GPU to zero
-	cudaMemset(d_output_image, 0, image_size);
-
-	cudaEventRecord(start);
-
-	for (int i = 0; i < num_iterations; ++i) {
+	for (int i = 0; i < iterations; ++i) {
 		convolution_kernel <<<numBlocks, threadsPerBlock >>> (d_input_image, d_output_image, width, height, output_channels);
 	}
 
-	cudaEventRecord(stop);
-	cudaEventSynchronize(stop);
+	CUDA_CHECK(cudaEventRecord(stop));
+	CUDA_CHECK(cudaEventSynchronize(stop));
 
 	float elapsed_time_gpu = 0.0f;
 	cudaEventElapsedTime(&elapsed_time_gpu, start, stop);
-	float average_time_gpu = elapsed_time_gpu / num_iterations;
-	std::cout << "\nParallel Convolution (GPU) completed in " << average_time_gpu << " ms" << std::endl;
-	std::cout << "Average computed on " << num_iterations << " iterations" << std::endl;
+	CUDA_CHECK(cudaEventDestroy(start));
+	CUDA_CHECK(cudaEventDestroy(stop));
 
-	cudaMemcpy(output_image, d_output_image, image_size, cudaMemcpyDeviceToHost);
+	float average_time_gpu = elapsed_time_gpu / iterations;
+
+	std::cout << "\nParallel Convolution (GPU) completed in " << average_time_gpu << " ms" << std::endl;
+	std::cout << "Average computed on " << iterations << " iterations" << std::endl;
+
+	CUDA_CHECK(cudaMemcpy(output_image, d_output_image, image_size, cudaMemcpyDeviceToHost));
 
 	// Save the output image
 	stbi_write_jpg(output_image_path_parallel, width, height, output_channels, output_image, quality);
@@ -301,8 +319,8 @@ int main(int argc, char** argv) {
 	// Free allocated memory
 	delete[] output_image;
 	stbi_image_free(input_image);
-	cudaFree(d_input_image);
-	cudaFree(d_output_image);
+	CUDA_CHECK(cudaFree(d_input_image));
+	CUDA_CHECK(cudaFree(d_output_image));
 
 	return 0;
 }
