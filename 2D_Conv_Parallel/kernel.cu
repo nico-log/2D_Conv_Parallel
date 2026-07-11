@@ -80,12 +80,12 @@ void convolution_cpu(
 }
 
 __global__ void convolution_kernel(
-	unsigned char* __restrict__ input_image,
-	unsigned char* __restrict__ output_image,
+	uchar4* __restrict__ input_image,
+	uchar4* __restrict__ output_image,
 	int width, int height, int channels)
 {
 	// SHARED MEMORY
-	__shared__ float shared_tile[TILE_SIZE][TILE_SIZE][3]; // [y][x][channel]
+	__shared__ float4 shared_tile[TILE_SIZE][TILE_SIZE]; // [y][x]
 
 	// Thread index within the block
 	int t_id = threadIdx.y * blockDim.x + threadIdx.x;
@@ -107,16 +107,22 @@ __global__ void convolution_kernel(
 		int image_x = origin_x + tile_x;
 		int image_y = origin_y + tile_y;
 
-		for (int c = 0; c < channels; ++c) {
+		int image_index = image_y * width + image_x;
 
-			shared_tile[tile_y][tile_x][c] = 0.0f; // default value for out-of-bounds pixels
+		uchar4 global_pixel = make_uchar4(0, 0, 0, 255); // default value for out-of-bounds pixels
 
-			if (image_x >= 0 && image_x < width && image_y >= 0 && image_y < height) {
-				int image_index = (image_y * width + image_x) * channels + c;
-				shared_tile[tile_y][tile_x][c] = input_image[image_index];	
-			}
+		// reading 32-bit alligned pixel from global memory (input image)
+		if (image_x >= 0 && image_x < width && image_y >= 0 && image_y < height) {
+			global_pixel = input_image[image_index];	
 		}
 
+		// storing pixel in shared memory (shared tile)
+		shared_tile[tile_y][tile_x] = make_float4(
+			(float)global_pixel.x, // R channel
+			(float)global_pixel.y, // G channel
+			(float)global_pixel.z, // B channel	
+			0.0f				   // A channel
+		);
 	}	
 
 	__syncthreads();
@@ -128,37 +134,43 @@ __global__ void convolution_kernel(
 
 	// guard against out-of-bounds threads
 	if (x < width && y < height) {
-		for (int c = 0; c < channels; ++c) {
-			float sum = 0.0f;
 
-			//filter (fy rows, fx cols)
+		float sum_r = 0.0f;
+		float sum_g = 0.0f;
+		float sum_b = 0.0f;
+
+		//filter (fy rows, fx cols)
+		#pragma unroll
+		for (int fy = -FILTER_RADIUS; fy <= FILTER_RADIUS; ++fy) {
 			#pragma unroll
-			for (int fy = -FILTER_RADIUS; fy <= FILTER_RADIUS; ++fy) {
-				#pragma unroll
-				for (int fx = -FILTER_RADIUS; fx <= FILTER_RADIUS; ++fx) {
+			for (int fx = -FILTER_RADIUS; fx <= FILTER_RADIUS; ++fx) {
 
-					float pixel_value = shared_tile[threadIdx.y + fy + FILTER_RADIUS][threadIdx.x + fx + FILTER_RADIUS][c];					
+				float filter_value = c_filter[(fy + FILTER_RADIUS) * FILTER_DIM + (fx + FILTER_RADIUS)];
 
-					int filter_index = (fy + FILTER_RADIUS) * FILTER_DIM + (fx + FILTER_RADIUS);
-					float filter_value = c_filter[filter_index];
+				sum_r += shared_tile[threadIdx.y + fy + FILTER_RADIUS][threadIdx.x + fx + FILTER_RADIUS].x * filter_value;
+				sum_g += shared_tile[threadIdx.y + fy + FILTER_RADIUS][threadIdx.x + fx + FILTER_RADIUS].y * filter_value;
+				sum_b += shared_tile[threadIdx.y + fy + FILTER_RADIUS][threadIdx.x + fx + FILTER_RADIUS].z * filter_value;
 
-					sum += pixel_value * filter_value;
-
-				}
 			}
-
-			// Clamp the result to [0, 255] and assign it to the output image
-			if (sum < 0.0f) sum = 0.0f;
-			if (sum > 255.0f) sum = 255.0f;
-
-			// Assign the computed value to the output image array (flattened 3D array)
-			int output_index = (y * width + x) * channels + c;
-			output_image[output_index] = static_cast<unsigned char>(sum); //cast float to unsigned char
 		}
+			
+		// Clamp the result to [0, 255] and assign it to the output image
+		sum_r = fminf(fmaxf(sum_r, 0.0f), 255.0f);
+		sum_g = fminf(fmaxf(sum_g, 0.0f), 255.0f);
+		sum_b = fminf(fmaxf(sum_b, 0.0f), 255.0f);
 
+		// Assign the computed value to the output image array 
+		output_image[y * width + x] = make_uchar4(
+			static_cast<unsigned char>(sum_r),
+			static_cast<unsigned char>(sum_g),
+			static_cast<unsigned char>(sum_b),
+			255 // A channel
+		);
 	}
-	
+
 }
+	
+
 
 int main(int argc, char** argv) {
 
@@ -223,7 +235,7 @@ int main(int argc, char** argv) {
 	const char* output_image_path_serial = "output_image_serial.jpg";
 
 	int width, height, input_channels;
-	int output_channels = 3;
+	int output_channels = 4;	// instead of 3 for RGBA output to avoid bank conflict in shared memory
 
 	unsigned char* input_image = stbi_load(input_image_path, &width, &height, &input_channels, output_channels);
 
@@ -257,11 +269,11 @@ int main(int argc, char** argv) {
 	const char* output_image_path_parallel = "output_image_parallel.jpg";
 
 	// GPU memory pointers
-	unsigned char* d_input_image = nullptr;
-	unsigned char* d_output_image = nullptr;
+	uchar4* d_input_image = nullptr;
+	uchar4* d_output_image = nullptr;
 
 	// Allocate GPU memory for input image, output image, and filter
-	size_t image_size = width * height * output_channels * sizeof(unsigned char);
+	size_t image_size = width * height * sizeof(uchar4);
 	size_t filter_size = FILTER_DIM * FILTER_DIM * sizeof(float);
 
 	CUDA_CHECK(cudaMalloc((void**)&d_input_image, image_size));
