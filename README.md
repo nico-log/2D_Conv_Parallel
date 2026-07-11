@@ -17,7 +17,7 @@ A CUDA C++ project that applies 3x3 convolution filters (Blur, Edge Detection, S
 Requires the CUDA Toolkit and a CUDA-capable GPU.
 
 ```bash
-nvcc main.cu -o convolution
+nvcc -O3 main.cu -o convolution
 ```
 
 ## Usage
