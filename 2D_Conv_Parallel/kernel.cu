@@ -39,6 +39,7 @@ void convolution_cpu(
 	const float* filter)
 {
 	// input image (y rows, x cols, c channels)
+	#pragma omp parallel for // Open-Multi Processing exploting all the CPU core
 	for (int y = 0; y < height; ++y) {
 		for (int x = 0; x < width; ++x) {
 			for (int c = 0; c < channels; ++c) {
