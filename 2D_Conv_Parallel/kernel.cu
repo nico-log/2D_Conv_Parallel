@@ -76,7 +76,11 @@ void convolution_cpu(
 				int output_index = (y * width + x) * channels + c;
 				output_image[output_index] = static_cast<unsigned char>(sum); //cast float to unsigned char
 			}
-		}
+
+			// Set the alpha channel to 255 (fully opaque) for RGBA output
+			int alpha_index = (y * width + x) * channels + 3;
+			output_image[alpha_index] = 255;
+		}	
 	}
 }
 
@@ -122,7 +126,7 @@ __global__ void convolution_kernel(
 			(float)global_pixel.x, // R channel
 			(float)global_pixel.y, // G channel
 			(float)global_pixel.z, // B channel	
-			0.0f				   // A channel
+			255				   // A channel
 		);
 	}	
 
@@ -171,7 +175,31 @@ __global__ void convolution_kernel(
 
 }
 	
+void validation(unsigned char* output_image_cpu, unsigned char* output_image_gpu, int width, int height, int channels, int tollerance) {
+	
+	bool is_valid = true;
+	int total_pixels = width * height * channels;
 
+	for (int i = 0; i < total_pixels; ++i) {
+
+		int diff = std::abs(static_cast<int>(output_image_cpu[i]) - static_cast<int>(output_image_gpu[i]));
+
+		if (diff > tollerance) {
+			is_valid = false;
+			std::cerr << "Validation failed at index " << i << ": CPU value = "
+				<< static_cast<int>(output_image_cpu[i]) << ", GPU value = "
+				<< static_cast<int>(output_image_gpu[i]) << ", difference = " << diff << std::endl;
+		}
+	}
+
+	if (is_valid) {
+		std::cout << "\nValidation successful: CPU and GPU results match within the specified tolerance of " << tollerance << std::endl;
+	}
+	else {
+		std::cerr << "\nValidation failed: CPU and GPU results do not match within the specified tolerance of " << tollerance << std::endl;
+	}
+
+}
 
 int main(int argc, char** argv) {
 
@@ -249,11 +277,11 @@ int main(int argc, char** argv) {
 
 	// CONVOLUTION
 	// Allocate memory for the output image
-	unsigned char* output_image = new unsigned char[width * height * output_channels];
+	unsigned char* output_image_cpu = new unsigned char[width * height * output_channels];
 
 	// Measure the time taken for convolution
 	auto start_time_cpu = std::chrono::high_resolution_clock::now();
-	convolution_cpu(input_image, output_image, width, height, output_channels, active_filter);
+	convolution_cpu(input_image, output_image_cpu, width, height, output_channels, active_filter);
 	auto end_time_cpu = std::chrono::high_resolution_clock::now();
 
 	std::chrono::duration<double, std::milli> elapsed_time_cpu = end_time_cpu - start_time_cpu;
@@ -261,12 +289,13 @@ int main(int argc, char** argv) {
 
 	// Save the output image
 	int quality = 100;
-	stbi_write_jpg(output_image_path_serial, width, height, output_channels, output_image, quality);
+	stbi_write_jpg(output_image_path_serial, width, height, output_channels, output_image_cpu, quality);
 
 	// =====================================================================
 	// PARALLEL GPU IMPLEMENTATION OF 2D CONVOLUTION WITH SHARED MEMORY
 	// =====================================================================
 
+	unsigned char* output_image_gpu = new unsigned char[width * height * output_channels];
 	const char* output_image_path_parallel = "output_image_parallel.jpg";
 
 	// GPU memory pointers
@@ -316,10 +345,10 @@ int main(int argc, char** argv) {
 	std::cout << "\nParallel Convolution (GPU) completed in " << average_time_gpu << " ms" << std::endl;
 	std::cout << "Average computed on " << iterations << " iterations" << std::endl;
 
-	CUDA_CHECK(cudaMemcpy(output_image, d_output_image, image_size, cudaMemcpyDeviceToHost));
+	CUDA_CHECK(cudaMemcpy(output_image_gpu, d_output_image, image_size, cudaMemcpyDeviceToHost));
 
 	// Save the output image
-	stbi_write_jpg(output_image_path_parallel, width, height, output_channels, output_image, quality);
+	stbi_write_jpg(output_image_path_parallel, width, height, output_channels, output_image_gpu, quality);
 
 	// speedup
 	std::cout << "\nSpeedup (CPU time / GPU avg time): " << elapsed_time_cpu.count() / average_time_gpu << "x" << std::endl;
@@ -329,8 +358,11 @@ int main(int argc, char** argv) {
 	std::cout << "1. Serial Convolution (CPU): " << output_image_path_serial << std::endl;
 	std::cout << "2. Parallel Convolution (GPU): " << output_image_path_parallel << std::endl;
 
+	validation(output_image_cpu, output_image_gpu, width, height, output_channels, 1);
+
 	// Free allocated memory
-	delete[] output_image;
+	delete[] output_image_cpu;
+	delete[] output_image_gpu;
 	stbi_image_free(input_image);
 	CUDA_CHECK(cudaFree(d_input_image));
 	CUDA_CHECK(cudaFree(d_output_image));
