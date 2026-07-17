@@ -6,6 +6,7 @@
 #include <iostream>
 #include <chrono>
 #include <string>
+#include <cmath>
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
@@ -17,6 +18,7 @@
 #define FILTER_DIM 3
 #define FILTER_RADIUS (FILTER_DIM / 2)
 #define TILE_SIZE (BLOCK_SIZE + 2 * FILTER_RADIUS)
+#define OUTPUT_CHANNELS 4 // RGBA
 
 #define CUDA_CHECK(call)                                                      \
     do {                                                                      \
@@ -28,7 +30,7 @@
         }                                                                     \
     } while (0)
 
-__constant__ float c_filter[FILTER_DIM*FILTER_DIM];
+__constant__ float c_filter[FILTER_DIM * FILTER_DIM];
 
 void convolution_cpu(
 	const unsigned char* input_image,
@@ -39,7 +41,7 @@ void convolution_cpu(
 	const float* filter)
 {
 	// input image (y rows, x cols, c channels)
-	#pragma omp parallel for // Open-Multi Processing exploting all the CPU core
+	//#pragma omp parallel for // Open-Multi Processing exploting all the CPU core
 	for (int y = 0; y < height; ++y) {
 		for (int x = 0; x < width; ++x) {
 			for (int c = 0; c < channels; ++c) {
@@ -76,6 +78,10 @@ void convolution_cpu(
 				int output_index = (y * width + x) * channels + c;
 				output_image[output_index] = static_cast<unsigned char>(sum); //cast float to unsigned char
 			}
+
+			// Set the alpha channel to 255 (fully opaque) for RGBA output
+			int alpha_index = (y * width + x) * channels + 3;
+			output_image[alpha_index] = 255;
 		}
 	}
 }
@@ -94,7 +100,7 @@ __global__ void convolution_kernel(
 	int num_pixels = TILE_SIZE * TILE_SIZE;		// 324 pixels per tile
 
 	// starting pixel index for this thread in the shared tile
-	int origin_x = blockIdx.x *	BLOCK_SIZE - FILTER_RADIUS;
+	int origin_x = blockIdx.x * BLOCK_SIZE - FILTER_RADIUS;
 	int origin_y = blockIdx.y * BLOCK_SIZE - FILTER_RADIUS;
 
 	// Loading pixels into shared memory
@@ -114,7 +120,7 @@ __global__ void convolution_kernel(
 
 		// reading 32-bit alligned pixel from global memory (input image)
 		if (image_x >= 0 && image_x < width && image_y >= 0 && image_y < height) {
-			global_pixel = input_image[image_index];	
+			global_pixel = input_image[image_index];
 		}
 
 		// storing pixel in shared memory (shared tile)
@@ -122,9 +128,9 @@ __global__ void convolution_kernel(
 			(float)global_pixel.x, // R channel
 			(float)global_pixel.y, // G channel
 			(float)global_pixel.z, // B channel	
-			0.0f				   // A channel
+			255				   // A channel
 		);
-	}	
+	}
 
 	__syncthreads();
 
@@ -141,9 +147,9 @@ __global__ void convolution_kernel(
 		float sum_b = 0.0f;
 
 		//filter (fy rows, fx cols)
-		#pragma unroll
+#pragma unroll
 		for (int fy = -FILTER_RADIUS; fy <= FILTER_RADIUS; ++fy) {
-			#pragma unroll
+#pragma unroll
 			for (int fx = -FILTER_RADIUS; fx <= FILTER_RADIUS; ++fx) {
 
 				float filter_value = c_filter[(fy + FILTER_RADIUS) * FILTER_DIM + (fx + FILTER_RADIUS)];
@@ -154,7 +160,7 @@ __global__ void convolution_kernel(
 
 			}
 		}
-			
+
 		// Clamp the result to [0, 255] and assign it to the output image
 		sum_r = fminf(fmaxf(sum_r, 0.0f), 255.0f);
 		sum_g = fminf(fmaxf(sum_g, 0.0f), 255.0f);
@@ -170,47 +176,76 @@ __global__ void convolution_kernel(
 	}
 
 }
-	
 
+
+int validation(unsigned char* output_image_cpu, unsigned char* output_image_gpu, int width, int height, int channels, int tollerance) {
+
+	bool is_valid = true;
+	int total_pixels = width * height * channels;
+
+	for (int i = 0; i < total_pixels; ++i) {
+
+		int diff = std::abs(static_cast<int>(output_image_cpu[i]) - static_cast<int>(output_image_gpu[i]));
+
+		if (diff > tollerance) {
+			is_valid = false;
+			std::cerr << "Validation failed at index " << i << ": CPU value = "
+				<< static_cast<int>(output_image_cpu[i]) << ", GPU value = "
+				<< static_cast<int>(output_image_gpu[i]) << ", difference = " << diff << std::endl;
+		}
+	}
+
+	if (!is_valid) {
+		std::cerr << "\nValidation failed: CPU and GPU results do not match within the specified tolerance of " << tollerance << std::endl;
+		return 1;
+	}
+	else {
+		return 0;
+	}
+}
+
+double get_bandwidth_gbps(int width, int height, double time_ms, int channels) {
+	double time_sec = time_ms / 1000.0;
+	double bytes_read = static_cast<double>(width * height * channels);
+	double bytes_write = static_cast<double>(width * height * channels);
+	double total_bytes = bytes_read + bytes_write;
+	return (total_bytes / 1e9) / time_sec;
+}
+
+double get_throughput_gflops(int width, int height, double time_ms, int channels) {
+	double time_sec = time_ms / 1000.0;
+	double flops_per_pixel = static_cast<double>(channels) * (FILTER_DIM * FILTER_DIM * 2.0);
+	double total_flops = static_cast<double>(width * height) * flops_per_pixel;
+	return (total_flops / 1e9) / time_sec;
+}
 
 int main(int argc, char** argv) {
 
-	if (argc < 4) {
+	if (argc < 5) {
 		std::cerr << "Error: missing arguments" << std::endl;
-		std::cerr << "Usage: " << argv[0] << " <filter_type> <image_path> <iterations>" << std::endl;
+		std::cerr << "Usage: " << argv[0] << " <filter_type> <iterations> <input_image_path> <output_image_path>" << std::endl;
 		std::cerr << "filter_type: blur, edge, sharpen" << std::endl;
 		return 1;
 	}
 
-	const int iterations = std::stoi(argv[3]);
+	const int iterations = std::stoi(argv[2]);
 
-	if (iterations < 0 || iterations > 100) {
+	if (iterations <= 0 || iterations > 100) {
 		std::cerr << "Error: iterations must be between 0 and 100" << std::endl;
 		return 1;
 	}
 
 	std::string filter_type = argv[1];
-	const char* input_image_path = argv[2];
+	const char* input_image_path = argv[3];
+	const char* output_image_path = argv[4];
 
 	const float* active_filter = nullptr;
 
-	float blur_filter[FILTER_DIM * FILTER_DIM] = {
-		1.0f / 9.0f, 1.0f / 9.0f, 1.0f / 9.0f,
-		1.0f / 9.0f, 1.0f / 9.0f, 1.0f / 9.0f,
-		1.0f / 9.0f, 1.0f / 9.0f, 1.0f / 9.0f
-	};
+	float blur_filter[FILTER_DIM * FILTER_DIM] = { 1.0f / 9.0f, 1.0f / 9.0f, 1.0f / 9.0f, 1.0f / 9.0f, 1.0f / 9.0f, 1.0f / 9.0f,	1.0f / 9.0f, 1.0f / 9.0f, 1.0f / 9.0f };
 
-	float edge_filter[FILTER_DIM * FILTER_DIM] = {
-		-1.0f, -1.0f, -1.0f,
-		-1.0f, 8.0f, -1.0f,
-		-1.0f, -1.0f, -1.0f
-	};
+	float edge_filter[FILTER_DIM * FILTER_DIM] = { -1.0f, -1.0f, -1.0f, -1.0f, 8.0f, -1.0f, -1.0f, -1.0f, -1.0f };
 
-	float sharpen_filter[FILTER_DIM * FILTER_DIM] = {
-		 0.0f, -1.0f,  0.0f,
-		-1.0f, 5.0f, -1.0f,
-		 0.0f, -1.0f,  0.0f
-	};
+	float sharpen_filter[FILTER_DIM * FILTER_DIM] = { 0.0f, -1.0f, 0.0f, -1.0f, 5.0f, -1.0f, 0.0f, -1.0f, 0.0f };
 
 	if (filter_type == "blur") {
 		active_filter = blur_filter;
@@ -226,47 +261,57 @@ int main(int argc, char** argv) {
 		return 1;
 	}
 
-	std::cout << "2D CONVOLUTION PERFORMANCE COMPARISON\n" << std::endl;
-
-	// =====================================================================
-	// SERIAL CPU IMPLEMENTATION OF 2D CONVOLUTION
-	// =====================================================================
-	
 	// LOADING IMAGE
-	const char* output_image_path_serial = "output_image_serial.jpg";
-
 	int width, height, input_channels;
-	int output_channels = 4;	// instead of 3 for RGBA output to avoid bank conflict in shared memory
 
-	unsigned char* input_image = stbi_load(input_image_path, &width, &height, &input_channels, output_channels);
+	unsigned char* input_image = stbi_load(input_image_path, &width, &height, &input_channels, OUTPUT_CHANNELS);
 
 	if (input_image == nullptr) {
 		std::cerr << "Error loading image: " << stbi_failure_reason() << std::endl;
 		return 1;
 	}
 
+	std::cout << "2D CONVOLUTION PERFORMANCE COMPARISON\n" << std::endl;
 	std::cout << input_image_path << " Loaded: " << width << "x" << height << ", Channels: " << input_channels << std::endl;
+	std::cout << "________________________________________________________________" << std::endl;
+
+	// =====================================================================
+	// SERIAL CPU IMPLEMENTATION OF 2D CONVOLUTION
+	// =====================================================================
+
+	const char* output_image_path_serial = "output_image_serial.jpg";
 
 	// CONVOLUTION
 	// Allocate memory for the output image
-	unsigned char* output_image = new unsigned char[width * height * output_channels];
+	unsigned char* output_image_cpu = new unsigned char[width * height * OUTPUT_CHANNELS];
 
 	// Measure the time taken for convolution
 	auto start_time_cpu = std::chrono::high_resolution_clock::now();
-	convolution_cpu(input_image, output_image, width, height, output_channels, active_filter);
+	convolution_cpu(input_image, output_image_cpu, width, height, OUTPUT_CHANNELS, active_filter);
 	auto end_time_cpu = std::chrono::high_resolution_clock::now();
 
 	std::chrono::duration<double, std::milli> elapsed_time_cpu = end_time_cpu - start_time_cpu;
-	std::cout << "\nSerial Convolution (CPU) completed in " << elapsed_time_cpu.count() << " ms" << std::endl;
+
+	std::cout << "\nSERIAL CONVOLUTION (CPU) PERFORMANCE RESULTS" << std::endl;
+	std::cout << " - Time:\t" << elapsed_time_cpu.count() << " ms" << std::endl;
+	//Bandwidth
+	std::cout << " - Bandwidth:\t" << get_bandwidth_gbps(width, height, elapsed_time_cpu.count(), OUTPUT_CHANNELS) << " GB/s" << std::endl;
+	//Throughput
+	std::cout << " - Throughput:\t" << get_throughput_gflops(width, height, elapsed_time_cpu.count(), OUTPUT_CHANNELS) << " GFLOPS" << std::endl;
 
 	// Save the output image
-	int quality = 100;
-	stbi_write_jpg(output_image_path_serial, width, height, output_channels, output_image, quality);
+	// int quality = 100;
+	// stbi_write_jpg(output_image_path_serial, width, height, OUTPUT_CHANNELS, output_image_cpu, quality);
+
+	//std::cout << "\nOutput image path: " << output_image_path_serial << std::endl;
+	std::cout << "________________________________________________________________" << std::endl;
+
 
 	// =====================================================================
 	// PARALLEL GPU IMPLEMENTATION OF 2D CONVOLUTION WITH SHARED MEMORY
 	// =====================================================================
 
+	unsigned char* output_image_gpu = new unsigned char[width * height * OUTPUT_CHANNELS];
 	const char* output_image_path_parallel = "output_image_parallel.jpg";
 
 	// GPU memory pointers
@@ -285,14 +330,16 @@ int main(int argc, char** argv) {
 	CUDA_CHECK(cudaMemcpyToSymbol(c_filter, active_filter, filter_size));
 
 	dim3 threadsPerBlock(BLOCK_SIZE, BLOCK_SIZE); // 16 x 16 = 256 threads per block
-	dim3 numBlocks((width + threadsPerBlock.x - 1) / threadsPerBlock.x, (height + threadsPerBlock.y - 1) / threadsPerBlock.y); // Round up to the nearest block
+	dim3 numBlocks(
+		(width + threadsPerBlock.x - 1) / threadsPerBlock.x,
+		(height + threadsPerBlock.y - 1) / threadsPerBlock.y); // Round up to the nearest block
 
 	cudaEvent_t start, stop;
 	CUDA_CHECK(cudaEventCreate(&start));
 	CUDA_CHECK(cudaEventCreate(&stop));
 
 	//Warm up kernel launch to avoid measuring initialization overhead
-	convolution_kernel << <numBlocks, threadsPerBlock >> > (d_input_image, d_output_image, width, height, output_channels);
+	convolution_kernel << <numBlocks, threadsPerBlock >> > (d_input_image, d_output_image, width, height, OUTPUT_CHANNELS);
 	CUDA_CHECK(cudaGetLastError());
 	CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -300,7 +347,7 @@ int main(int argc, char** argv) {
 	CUDA_CHECK(cudaEventRecord(start));
 
 	for (int i = 0; i < iterations; ++i) {
-		convolution_kernel <<<numBlocks, threadsPerBlock >>> (d_input_image, d_output_image, width, height, output_channels);
+		convolution_kernel << <numBlocks, threadsPerBlock >> > (d_input_image, d_output_image, width, height, OUTPUT_CHANNELS);
 	}
 
 	CUDA_CHECK(cudaEventRecord(stop));
@@ -313,24 +360,43 @@ int main(int argc, char** argv) {
 
 	float average_time_gpu = elapsed_time_gpu / iterations;
 
-	std::cout << "\nParallel Convolution (GPU) completed in " << average_time_gpu << " ms" << std::endl;
-	std::cout << "Average computed on " << iterations << " iterations" << std::endl;
+	std::cout << "\n PARALLEL CONVOLUTION (GPU) PERFORMANCE RESULTS" << std::endl;
 
-	CUDA_CHECK(cudaMemcpy(output_image, d_output_image, image_size, cudaMemcpyDeviceToHost));
+	std::cout << " - Avg time:\t" << average_time_gpu << " ms (" << iterations << " iterations)" << std::endl;
 
+	CUDA_CHECK(cudaMemcpy(output_image_gpu, d_output_image, image_size, cudaMemcpyDeviceToHost));
+
+	//Bandwidth
+	std::cout << " - Bandwidth:\t" << get_bandwidth_gbps(width, height, average_time_gpu, OUTPUT_CHANNELS) << " GB/s" << std::endl;
+	//Throughput
+	std::cout << " - Throughput:\t" << get_throughput_gflops(width, height, average_time_gpu, OUTPUT_CHANNELS) << " GFLOPS" << std::endl;
 	// Save the output image
-	stbi_write_jpg(output_image_path_parallel, width, height, output_channels, output_image, quality);
+	//stbi_write_jpg(output_image_path_parallel, width, height, OUTPUT_CHANNELS, output_image_gpu, quality);
+	//std::cout << "\nOutput image path: " << output_image_path_parallel << std::endl;
+	std::cout << "________________________________________________________________" << std::endl;
 
 	// speedup
 	std::cout << "\nSpeedup (CPU time / GPU avg time): " << elapsed_time_cpu.count() / average_time_gpu << "x" << std::endl;
-	
-	// output image paths
-	std::cout << "\nAll the output images have been saved in different path: " << std::endl;
-	std::cout << "1. Serial Convolution (CPU): " << output_image_path_serial << std::endl;
-	std::cout << "2. Parallel Convolution (GPU): " << output_image_path_parallel << std::endl;
+
+	// validation
+	int quality = 100;
+	if (validation(output_image_cpu, output_image_gpu, width, height, OUTPUT_CHANNELS, 1) == 0){
+		stbi_write_jpg(output_image_path, width, height, OUTPUT_CHANNELS, output_image_gpu, quality);
+		std::cout << "\nOuput image path: " << output_image_path << std::endl;
+	}
+	else {
+		stbi_write_jpg(output_image_path_serial, width, height, OUTPUT_CHANNELS, output_image_cpu, quality);
+		stbi_write_jpg(output_image_path_parallel, width, height, OUTPUT_CHANNELS, output_image_gpu, quality);
+
+		std::cerr << "\nValidation failed: results do not match within the specified tolerance" << std::endl;
+		std::cout << "\nAll the output images have been saved in different path: " << std::endl;
+		std::cout << "1. Serial Convolution (CPU): " << output_image_path_serial << std::endl;
+		std::cout << "2. Parallel Convolution (GPU): " << output_image_path_parallel << std::endl;
+	}
 
 	// Free allocated memory
-	delete[] output_image;
+	delete[] output_image_cpu;
+	delete[] output_image_gpu;
 	stbi_image_free(input_image);
 	CUDA_CHECK(cudaFree(d_input_image));
 	CUDA_CHECK(cudaFree(d_output_image));
