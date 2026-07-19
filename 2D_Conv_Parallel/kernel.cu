@@ -148,8 +148,8 @@ __global__ void convolution_kernel_shared(
 	int num_threads = blockDim.x * blockDim.y;
 	int num_pixels = TILE_SIZE * TILE_SIZE;
 
-	int origin_x = blockIdx.x * BLOCK_SIZE - FILTER_RADIUS;
-	int origin_y = blockIdx.y * BLOCK_SIZE - FILTER_RADIUS;
+	int origin_x = blockIdx.x * blockDim.x - FILTER_RADIUS;
+	int origin_y = blockIdx.y * blockDim.y - FILTER_RADIUS;
 
 	for (int i = t_id; i < num_pixels; i += num_threads) {
 		int tile_y = i / TILE_SIZE;
@@ -216,8 +216,8 @@ __global__ void convolution_kernel_shared_constant(
 	int num_threads = blockDim.x * blockDim.y;
 	int num_pixels = TILE_SIZE * TILE_SIZE;
 
-	int origin_x = blockIdx.x * BLOCK_SIZE - FILTER_RADIUS;
-	int origin_y = blockIdx.y * BLOCK_SIZE - FILTER_RADIUS;
+	int origin_x = blockIdx.x * blockDim.x - FILTER_RADIUS;
+	int origin_y = blockIdx.y * blockDim.y - FILTER_RADIUS;
 
 	for (int i = t_id; i < num_pixels; i += num_threads) {
 		int tile_y = i / TILE_SIZE;
@@ -282,8 +282,8 @@ __global__ void convolution_kernel_constant_vector(
 	int num_threads = blockDim.x * blockDim.y;
 	int num_pixels = TILE_SIZE * TILE_SIZE;
 
-	int origin_x = blockIdx.x * BLOCK_SIZE - FILTER_RADIUS;
-	int origin_y = blockIdx.y * BLOCK_SIZE - FILTER_RADIUS;
+	int origin_x = blockIdx.x * blockDim.x - FILTER_RADIUS;
+	int origin_y = blockIdx.y * blockDim.y - FILTER_RADIUS;
 
 	for (int i = t_id; i < num_pixels; i += num_threads) {
 		int tile_y = i / TILE_SIZE;
@@ -355,8 +355,8 @@ __global__ void convolution_kernel_optimized(
 	int num_threads = blockDim.x * blockDim.y;
 	int num_pixels = TILE_SIZE * TILE_SIZE;
 
-	int origin_x = blockIdx.x * BLOCK_SIZE - FILTER_RADIUS;
-	int origin_y = blockIdx.y * BLOCK_SIZE - FILTER_RADIUS;
+	int origin_x = blockIdx.x * blockDim.x - FILTER_RADIUS;
+	int origin_y = blockIdx.y * blockDim.y - FILTER_RADIUS;
 
 	for (int i = t_id; i < num_pixels; i += num_threads) {
 		int tile_y = i / TILE_SIZE;
