@@ -523,13 +523,13 @@ int main(int argc, char** argv) {
 		std::cout << "SERIAL CONVOLUTION (CPU)" << std::endl;
 		// Warmup
 		convolution_cpu(input_image, output_image_cpu, width, height, active_filter);
+
 		auto start_time_cpu = std::chrono::high_resolution_clock::now();
-		for (int i = 0; i < iterations; ++i) {
-			convolution_cpu(input_image, output_image_cpu, width, height, active_filter);
-		}
+		convolution_cpu(input_image, output_image_cpu, width, height, active_filter);
 		auto end_time_cpu = std::chrono::high_resolution_clock::now();
+
 		std::chrono::duration<double, std::milli> elapsed_time_cpu = end_time_cpu - start_time_cpu;
-		double time_cpu = elapsed_time_cpu.count()/iterations;
+		double time_cpu = elapsed_time_cpu.count();
 
 		std::cout << " - Time:\t" << time_cpu << " ms" << std::endl;
 		std::cout << " - Performance:\t" << get_throughput_mpixels(width, height, time_cpu) << " MPixels/s" << std::endl;
