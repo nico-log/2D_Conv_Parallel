@@ -88,7 +88,7 @@ void convolution_cpu(
 // PARALLEL GPU IMPLEMENTATION (NAIVE)
 // =====================================================================
 __global__ void convolution_kernel_naive(
-	unsigned char* input_image,
+	const unsigned char* input_image,
 	unsigned char* output_image,
 	int width, int height,
 	const float* filter_matrix)
@@ -137,7 +137,7 @@ __global__ void convolution_kernel_naive(
 // PARALLEL GPU IMPLEMENTATION (SHARED MEMORY - BASIC)
 // =====================================================================
 __global__ void convolution_kernel_shared(
-	unsigned char* input_image,
+	const unsigned char* input_image,
 	unsigned char* output_image,
 	int width, int height,
 	const float* filter_matrix)
@@ -206,7 +206,7 @@ __global__ void convolution_kernel_shared(
 // PARALLEL GPU IMPLEMENTATION (SHARED MEMORY + CONSTANT MEMORY)
 // =====================================================================
 __global__ void convolution_kernel_shared_constant(
-	unsigned char* input_image,
+	const unsigned char* input_image,
 	unsigned char* output_image,
 	int width, int height)
 {
@@ -391,9 +391,9 @@ __global__ void convolution_kernel_optimized(
 		float sum_g = 0.0f;
 		float sum_b = 0.0f;
 
-#pragma unroll
+		#pragma unroll
 		for (int fy = -FILTER_RADIUS; fy <= FILTER_RADIUS; ++fy) {
-#pragma unroll
+			#pragma unroll
 			for (int fx = -FILTER_RADIUS; fx <= FILTER_RADIUS; ++fx) {
 
 				float filter_value = c_filter[(fy + FILTER_RADIUS) * FILTER_DIM + (fx + FILTER_RADIUS)];
@@ -420,14 +420,14 @@ __global__ void convolution_kernel_optimized(
 // =====================================================================
 // UTILITIES
 // =====================================================================
-int validation(unsigned char* output_image_cpu, unsigned char* output_image_gpu, int width, int height, int tollerance) {
+int validation(unsigned char* output_image_cpu, unsigned char* output_image_gpu, int width, int height, int tolerance) {
 	bool is_valid = true;
 	int total_pixels = width * height * RGBA_CHANNELS;
 
 	for (int i = 0; i < total_pixels; ++i) {
 		int diff = std::abs(static_cast<int>(output_image_cpu[i]) - static_cast<int>(output_image_gpu[i]));
 
-		if (diff > tollerance) {
+		if (diff > tolerance) {
 			is_valid = false;
 			std::cerr << "Validation failed at index " << i << ": CPU value = "
 				<< static_cast<int>(output_image_cpu[i]) << ", GPU value = "
@@ -438,7 +438,7 @@ int validation(unsigned char* output_image_cpu, unsigned char* output_image_gpu,
 	}
 
 	if (!is_valid) {
-		std::cerr << " -> CPU and GPU results do not match within the specified tolerance of " << tollerance << std::endl;
+		std::cerr << " -> CPU and GPU results do not match within the specified tolerance of " << tolerance << std::endl;
 		return 1;
 	}
 	return 0;
@@ -463,7 +463,7 @@ int main(int argc, char** argv) {
 	const int iterations = std::stoi(argv[2]);
 
 	if (iterations <= 0 || iterations > 100) {
-		std::cerr << "Error: iterations must be between 0 and 100" << std::endl;
+		std::cerr << "Error: iterations must be between 1 and 100" << std::endl;
 		return 1;
 	}
 
