@@ -22,6 +22,7 @@
 #define RGB_CHANNELS 3
 #define RGBA_CHANNELS 4 
 
+// Error checking macro for CUDA calls
 #define CUDA_CHECK(call)                                                      \
     do {                                                                      \
         cudaError_t err = call;                                               \
@@ -43,13 +44,14 @@ void convolution_cpu(
 	int width,
 	int height,
 	const float* filter)
-{
+{	// Loop over each pixel in the image
 	for (int y = 0; y < height; ++y) {
 		for (int x = 0; x < width; ++x) {
 			for (int c = 0; c < RGB_CHANNELS; ++c) {
 				
 				float sum = 0.0f;
 
+				// Loop over the filter kernel
 				for (int fy = -FILTER_RADIUS; fy <= FILTER_RADIUS; ++fy) {
 					for (int fx = -FILTER_RADIUS; fx <= FILTER_RADIUS; ++fx) {
 
@@ -58,6 +60,7 @@ void convolution_cpu(
 
 						float pixel_value = 0.0f;	// Default to 0 for out-of-bounds pixels
 
+						// Zero-padding: Only accumulate if the pixel is within image bounds
 						if (ix >= 0 && ix < width && iy >= 0 && iy < height) {
 							int pixel_index = (iy * width + ix) * RGBA_CHANNELS + c;
 							pixel_value = static_cast<float>(input_image[pixel_index]);
@@ -93,6 +96,7 @@ __global__ void convolution_kernel_naive(
 	int width, int height,
 	const float* filter_matrix)
 {
+	// Mapping coordinates
 	int x = blockIdx.x * blockDim.x + threadIdx.x;
 	int y = blockIdx.y * blockDim.y + threadIdx.y;
 
@@ -142,23 +146,31 @@ __global__ void convolution_kernel_shared(
 	int width, int height,
 	const float* filter_matrix)
 {
+	//	PIXEL LOADING INTO SHARED MEMORY
+	// Shared memory allocation
 	__shared__ float shared_tile[TILE_SIZE][TILE_SIZE][RGB_CHANNELS];
 
-	int t_id = threadIdx.y * blockDim.x + threadIdx.x;
-	int num_threads = blockDim.x * blockDim.y;
-	int num_pixels = TILE_SIZE * TILE_SIZE;
+	int t_id = threadIdx.y * blockDim.x + threadIdx.x;	// linear thread index
+	int num_threads = blockDim.x * blockDim.y;			// 16 x 16 = 256
+	int num_pixels = TILE_SIZE * TILE_SIZE;				// 18 x 18 = 324
 
+	// global origin coordinates of shared tile
 	int origin_x = blockIdx.x * blockDim.x - FILTER_RADIUS;
 	int origin_y = blockIdx.y * blockDim.y - FILTER_RADIUS;
 
+	// first 256 thread load the first 256 pixel
+	// remaining 68 pixels loaded in the second iteration with the first 68 threads
 	for (int i = t_id; i < num_pixels; i += num_threads) {
+		// pixel coordinates in the tile
 		int tile_y = i / TILE_SIZE;
 		int tile_x = i % TILE_SIZE;
 
+		// pixel global coordinates
 		int image_x = origin_x + tile_x;
 		int image_y = origin_y + tile_y;
 
 		for (int c = 0; c < RGB_CHANNELS; ++c) {
+			// zero padding for tiles near the boundary
 			shared_tile[tile_y][tile_x][c] = 0.0f;
 
 			if (image_x >= 0 && image_x < width && image_y >= 0 && image_y < height) {
@@ -170,6 +182,7 @@ __global__ void convolution_kernel_shared(
 
 	__syncthreads();
 
+	// CONVOLUTION OPERATION READING SHARED MEMORY
 	int x = blockIdx.x * blockDim.x + threadIdx.x;
 	int y = blockIdx.y * blockDim.y + threadIdx.y;
 
@@ -180,7 +193,9 @@ __global__ void convolution_kernel_shared(
 			for (int fy = -FILTER_RADIUS; fy <= FILTER_RADIUS; ++fy) {
 				for (int fx = -FILTER_RADIUS; fx <= FILTER_RADIUS; ++fx) {
 
+					// Shared memory reading (instead of global memory)
 					float pixel_value = shared_tile[threadIdx.y + fy + FILTER_RADIUS][threadIdx.x + fx + FILTER_RADIUS][c];
+					// FILTER_RADIUS offset to access the correct pixel avoiding negative index (0, 0) -> halo pixel
 
 					int filter_index = (fy + FILTER_RADIUS) * FILTER_DIM + (fx + FILTER_RADIUS);
 					float filter_value = filter_matrix[filter_index];
@@ -250,7 +265,9 @@ __global__ void convolution_kernel_shared_constant(
 
 					float pixel_value = shared_tile[threadIdx.y + fy + FILTER_RADIUS][threadIdx.x + fx + FILTER_RADIUS][c];
 
+					// constant memory to read filter
 					float filter_value = c_filter[(fy + FILTER_RADIUS) * FILTER_DIM + (fx + FILTER_RADIUS)];
+					// filter radius offset to avoid negative index and access the correct filter value
 
 					sum += pixel_value * filter_value;
 				}
@@ -276,7 +293,8 @@ __global__ void convolution_kernel_constant_vector(
 	uchar4* __restrict__ output_image,
 	int width, int height)
 {
-	__shared__ float4 shared_tile[TILE_SIZE][TILE_SIZE];
+	// 2D shared (channel dimension deleted)
+	__shared__ float4 shared_tile[TILE_SIZE][TILE_SIZE]; 
 
 	int t_id = threadIdx.y * blockDim.x + threadIdx.x;
 	int num_threads = blockDim.x * blockDim.y;
@@ -285,6 +303,7 @@ __global__ void convolution_kernel_constant_vector(
 	int origin_x = blockIdx.x * blockDim.x - FILTER_RADIUS;
 	int origin_y = blockIdx.y * blockDim.y - FILTER_RADIUS;
 
+	// Shared memory loading (1 instruction per pixel, no more channel loop)
 	for (int i = t_id; i < num_pixels; i += num_threads) {
 		int tile_y = i / TILE_SIZE;
 		int tile_x = i % TILE_SIZE;
@@ -293,12 +312,14 @@ __global__ void convolution_kernel_constant_vector(
 		int image_y = origin_y + tile_y;
 		int image_index = image_y * width + image_x;
 
+		// Zero-padding
 		uchar4 global_pixel = make_uchar4(0, 0, 0, 255);
 
 		if (image_x >= 0 && image_x < width && image_y >= 0 && image_y < height) {
 			global_pixel = input_image[image_index];
 		}
 
+		// conversion to float4 for convolution with filter matrix
 		shared_tile[tile_y][tile_x] = make_float4(
 			(float)global_pixel.x,
 			(float)global_pixel.y,
@@ -314,6 +335,7 @@ __global__ void convolution_kernel_constant_vector(
 
 	if (x < width && y < height) {
 
+		// parallel computation of the 3 channels
 		float sum_r = 0.0f;
 		float sum_g = 0.0f;
 		float sum_b = 0.0f;
@@ -323,12 +345,14 @@ __global__ void convolution_kernel_constant_vector(
 
 				float filter_value = c_filter[(fy + FILTER_RADIUS) * FILTER_DIM + (fx + FILTER_RADIUS)];
 
+				// access .x .y .z fields of float4
 				sum_r += shared_tile[threadIdx.y + fy + FILTER_RADIUS][threadIdx.x + fx + FILTER_RADIUS].x * filter_value;
 				sum_g += shared_tile[threadIdx.y + fy + FILTER_RADIUS][threadIdx.x + fx + FILTER_RADIUS].y * filter_value;
 				sum_b += shared_tile[threadIdx.y + fy + FILTER_RADIUS][threadIdx.x + fx + FILTER_RADIUS].z * filter_value;
 			}
 		}
 
+		// optimized claming operations
 		sum_r = fminf(fmaxf(sum_r, 0.0f), 255.0f);
 		sum_g = fminf(fmaxf(sum_g, 0.0f), 255.0f);
 		sum_b = fminf(fmaxf(sum_b, 0.0f), 255.0f);
@@ -451,7 +475,12 @@ double get_throughput_mpixels(int width, int height, double time_ms) {
 	return (total_pixels / 1e6) / time_sec;
 }
 
+// =====================================================================
+// MAIN
+// =====================================================================
 int main(int argc, char** argv) {
+
+	// ===================== PARSING =====================
 
 	if (argc < 5) {
 		std::cerr << "Error: missing arguments" << std::endl;
@@ -485,7 +514,7 @@ int main(int argc, char** argv) {
 		return 1;
 	}
 
-	// LOADING IMAGE
+	// ===================== LOADING IMAGE =====================
 	int width, height, input_channels;
 	unsigned char* input_image = stbi_load(input_image_path, &width, &height, &input_channels, RGBA_CHANNELS);
 
