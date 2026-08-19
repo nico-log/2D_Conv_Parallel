@@ -48,7 +48,7 @@ void convolution_cpu(
 	for (int y = 0; y < height; ++y) {
 		for (int x = 0; x < width; ++x) {
 			for (int c = 0; c < RGB_CHANNELS; ++c) {
-				
+
 				float sum = 0.0f;
 
 				// Loop over the filter kernel
@@ -81,7 +81,7 @@ void convolution_cpu(
 			}
 
 			// Set the alpha channel to 255 (fully opaque) for RGBA output
-			int alpha_index = (y * width + x) *	RGBA_CHANNELS + RGB_CHANNELS;
+			int alpha_index = (y * width + x) * RGBA_CHANNELS + RGB_CHANNELS;
 			output_image[alpha_index] = 255;
 		}
 	}
@@ -294,7 +294,7 @@ __global__ void convolution_kernel_constant_vector(
 	int width, int height)
 {
 	// 2D shared (channel dimension deleted)
-	__shared__ float4 shared_tile[TILE_SIZE][TILE_SIZE]; 
+	__shared__ float4 shared_tile[TILE_SIZE][TILE_SIZE];
 
 	int t_id = threadIdx.y * blockDim.x + threadIdx.x;
 	int num_threads = blockDim.x * blockDim.y;
@@ -415,9 +415,9 @@ __global__ void convolution_kernel_optimized(
 		float sum_g = 0.0f;
 		float sum_b = 0.0f;
 
-		#pragma unroll
+#pragma unroll
 		for (int fy = -FILTER_RADIUS; fy <= FILTER_RADIUS; ++fy) {
-			#pragma unroll
+#pragma unroll
 			for (int fx = -FILTER_RADIUS; fx <= FILTER_RADIUS; ++fx) {
 
 				float filter_value = c_filter[(fy + FILTER_RADIUS) * FILTER_DIM + (fx + FILTER_RADIUS)];
@@ -525,6 +525,7 @@ int main(int argc, char** argv) {
 
 	std::cout << "================================================================" << std::endl;
 	std::cout << "2D CONVOLUTION PERFORMANCE COMPARISON" << std::endl;
+	std::cout << "Filter Dimensions: " << FILTER_DIM << "x" << FILTER_DIM << std::endl;
 	std::cout << input_image_path << " Loaded: " << width << "x" << height << ", Channels: " << input_channels << " -> " << RGBA_CHANNELS << " (RGBA)" << std::endl;
 	std::cout << "================================================================\n" << std::endl;
 
@@ -548,22 +549,22 @@ int main(int argc, char** argv) {
 
 
 	// ===================== CPU BASELINE =====================
-	
-		std::cout << "SERIAL CONVOLUTION (CPU)" << std::endl;
-		// Warmup
-		convolution_cpu(input_image, output_image_cpu, width, height, active_filter);
 
-		auto start_time_cpu = std::chrono::high_resolution_clock::now();
-		convolution_cpu(input_image, output_image_cpu, width, height, active_filter);
-		auto end_time_cpu = std::chrono::high_resolution_clock::now();
+	std::cout << "SERIAL CONVOLUTION (CPU)" << std::endl;
+	// Warmup
+	convolution_cpu(input_image, output_image_cpu, width, height, active_filter);
 
-		std::chrono::duration<double, std::milli> elapsed_time_cpu = end_time_cpu - start_time_cpu;
-		double time_cpu = elapsed_time_cpu.count();
+	auto start_time_cpu = std::chrono::high_resolution_clock::now();
+	convolution_cpu(input_image, output_image_cpu, width, height, active_filter);
+	auto end_time_cpu = std::chrono::high_resolution_clock::now();
 
-		std::cout << " - Time:\t" << time_cpu << " ms" << std::endl;
-		std::cout << " - Performance:\t" << get_throughput_mpixels(width, height, time_cpu) << " MPixels/s" << std::endl;
-		std::cout << "________________________________________________________________\n" << std::endl;
-	
+	std::chrono::duration<double, std::milli> elapsed_time_cpu = end_time_cpu - start_time_cpu;
+	double time_cpu = elapsed_time_cpu.count();
+
+	std::cout << " - Time:\t" << time_cpu << " ms" << std::endl;
+	std::cout << " - Performance:\t" << get_throughput_mpixels(width, height, time_cpu) << " MPixels/s" << std::endl;
+	std::cout << "________________________________________________________________\n" << std::endl;
+
 
 	// ===================== 1. GPU NAIVE =====================
 	{
@@ -774,14 +775,14 @@ int main(int argc, char** argv) {
 	if (validation(output_image_cpu, output_image_opt, width, height, 1) != 0) { std::cerr << "Shared Optimized GPU Failed!" << std::endl; is_valid = false; }
 
 	if (is_valid) {
-		
+
 		std::cout << "Success! All GPU versions match CPU baseline." << std::endl;
 		std::cout << "Final image saved to: " << output_image_path << std::endl;
 
 		if (!stbi_write_jpg(output_image_path, width, height, RGBA_CHANNELS, output_image_opt, quality)) {
 			std::cerr << "Failed to save optimized GPU image!" << std::endl;
 		}
-		
+
 	}
 	else {
 
