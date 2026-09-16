@@ -1,4 +1,24 @@
-﻿#define _CRT_SECURE_NO_WARNINGS
+﻿/*************************************************************************
+
+OPTIMIZATION OF A 2D CONVOLUTION
+Project for Advanced Computer Architecture course
+University of Pavia
+
+Author: Nicolò Galli
+External Libraries: stb_image.h, stb_image_write.h
+Last update: 16/09/2026
+
+*************************************************************************/
+
+/*NOTE ON BENCHMARK DESIGN :
+	GPU buffers are intentionally allocated and freed inside each scope block.
+	While a production pipeline would allocate memory once and reuse it across runs,
+	here each kernel is tested in complete isolation to prevent side effects or 
+	resident cache reuse between implementations. Timing events strictly isolate 
+	and measure only the raw kernel execution time.*/
+
+// Disable warning messages caused by standard C function included in stb lib
+#define _CRT_SECURE_NO_WARNINGS
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
 
@@ -23,6 +43,7 @@
 #define RGBA_CHANNELS 4 
 
 // Error checking macro for CUDA calls
+// Cuda calls returns cudaError_t type (except for the kernel launch)
 #define CUDA_CHECK(call)                                                      \
     do {                                                                      \
         cudaError_t err = call;                                               \
@@ -33,7 +54,7 @@
         }                                                                     \
     } while (0)
 
-__constant__ float c_filter[FILTER_DIM * FILTER_DIM];	// Constant memory for filter coefficients
+__constant__ float c_filter[FILTER_DIM * FILTER_DIM];	// Constant memory allocation for filter coefficients
 
 // =====================================================================
 // SERIAL CPU IMPLEMENTATION
@@ -55,17 +76,19 @@ void convolution_cpu(
 				for (int fy = -FILTER_RADIUS; fy <= FILTER_RADIUS; ++fy) {
 					for (int fx = -FILTER_RADIUS; fx <= FILTER_RADIUS; ++fx) {
 
+						// pixel coordinates
 						int ix = x + fx;
 						int iy = y + fy;
 
 						float pixel_value = 0.0f;	// Default to 0 for out-of-bounds pixels
 
-						// Zero-padding: Only accumulate if the pixel is within image bounds
+						// Zero-padding: read only if the pixel is within image bounds
 						if (ix >= 0 && ix < width && iy >= 0 && iy < height) {
 							int pixel_index = (iy * width + ix) * RGBA_CHANNELS + c;
 							pixel_value = static_cast<float>(input_image[pixel_index]);
 						}
 
+						// FILTER_RADIUS offset to avoid negative index
 						int filter_index = (fy + FILTER_RADIUS) * FILTER_DIM + (fx + FILTER_RADIUS);
 						float filter_value = filter[filter_index];
 
@@ -76,6 +99,7 @@ void convolution_cpu(
 				if (sum < 0.0f) sum = 0.0f;
 				if (sum > 255.0f) sum = 255.0f;
 
+				// Writing the convolution result
 				int output_index = (y * width + x) * RGBA_CHANNELS + c;
 				output_image[output_index] = static_cast<unsigned char>(sum);
 			}
@@ -100,6 +124,7 @@ __global__ void convolution_kernel_naive(
 	int x = blockIdx.x * blockDim.x + threadIdx.x;
 	int y = blockIdx.y * blockDim.y + threadIdx.y;
 
+	// Allocated threads outside the image are inactive
 	if (x < width && y < height) {
 		for (int c = 0; c < RGB_CHANNELS; ++c) {
 			float sum = 0.0f;
@@ -158,17 +183,19 @@ __global__ void convolution_kernel_shared(
 	int origin_x = blockIdx.x * blockDim.x - FILTER_RADIUS;
 	int origin_y = blockIdx.y * blockDim.y - FILTER_RADIUS;
 
-	// first 256 thread load the first 256 pixel
-	// remaining 68 pixels loaded in the second iteration with the first 68 threads
+	// 2 iterations:
+	//  - first 256 thread load the first 256 pixel
+	//  - remaining 68 pixels loaded in the second iteration with the first 68 threads
 	for (int i = t_id; i < num_pixels; i += num_threads) {
-		// pixel coordinates in the tile
-		int tile_y = i / TILE_SIZE;
-		int tile_x = i % TILE_SIZE;
+		// pixel coordinates in the tile (from 1D to 2D)
+		int tile_y = i / TILE_SIZE; // row index
+		int tile_x = i % TILE_SIZE; // col index
 
 		// pixel global coordinates
 		int image_x = origin_x + tile_x;
 		int image_y = origin_y + tile_y;
 
+		// writing into shared memory tile
 		for (int c = 0; c < RGB_CHANNELS; ++c) {
 			// zero padding for tiles near the boundary
 			shared_tile[tile_y][tile_x][c] = 0.0f;
@@ -194,13 +221,16 @@ __global__ void convolution_kernel_shared(
 				for (int fx = -FILTER_RADIUS; fx <= FILTER_RADIUS; ++fx) {
 
 					// Shared memory reading (instead of global memory)
+					// Along x direction:	Tile index 0 and 17		-> halo
+					//						Tile index from 1 to 16	-> thread correspondence 
+					// thread indexes: [0, 15] [0, 15]
 					float pixel_value = shared_tile[threadIdx.y + fy + FILTER_RADIUS][threadIdx.x + fx + FILTER_RADIUS][c];
 					// FILTER_RADIUS offset to access the correct pixel avoiding negative index (0, 0) -> halo pixel
 
 					int filter_index = (fy + FILTER_RADIUS) * FILTER_DIM + (fx + FILTER_RADIUS);
 					float filter_value = filter_matrix[filter_index];
 
-					sum += pixel_value * filter_value;
+					sum += pixel_value * filter_value; // convolution
 				}
 			}
 
@@ -266,6 +296,7 @@ __global__ void convolution_kernel_shared_constant(
 					float pixel_value = shared_tile[threadIdx.y + fy + FILTER_RADIUS][threadIdx.x + fx + FILTER_RADIUS][c];
 
 					// constant memory to read filter
+					// constant memory declared as global at the beginning of the file: 1D array FILTER_DIM * FILTER_DIM
 					float filter_value = c_filter[(fy + FILTER_RADIUS) * FILTER_DIM + (fx + FILTER_RADIUS)];
 					// filter radius offset to avoid negative index and access the correct filter value
 
@@ -288,12 +319,14 @@ __global__ void convolution_kernel_shared_constant(
 // =====================================================================
 // PARALLEL GPU IMPLEMENTATION (SHARED MEMORY + CONSTANT MEMORY + VECTORIZED)
 // =====================================================================
-__global__ void convolution_kernel_constant_vector(
+__global__ void convolution_kernel_shared_constant_vector(
 	uchar4* __restrict__ input_image,
 	uchar4* __restrict__ output_image,
 	int width, int height)
+	//	__restrict__ to guarantee nvcc that pointers do not overlap in memory
+	// => less control => less latencies and better instruction scheduling
 {
-	// 2D shared (channel dimension deleted)
+	// 2D shared (channel dimension deleted, it is included in float4 vectorial type)
 	__shared__ float4 shared_tile[TILE_SIZE][TILE_SIZE];
 
 	int t_id = threadIdx.y * blockDim.x + threadIdx.x;
@@ -312,7 +345,7 @@ __global__ void convolution_kernel_constant_vector(
 		int image_y = origin_y + tile_y;
 		int image_index = image_y * width + image_x;
 
-		// Zero-padding
+		// Zero-padding with boundary check
 		uchar4 global_pixel = make_uchar4(0, 0, 0, 255);
 
 		if (image_x >= 0 && image_x < width && image_y >= 0 && image_y < height) {
@@ -324,7 +357,7 @@ __global__ void convolution_kernel_constant_vector(
 			(float)global_pixel.x,
 			(float)global_pixel.y,
 			(float)global_pixel.z,
-			255
+			255 // alpha channel
 		);
 	}
 
@@ -335,7 +368,7 @@ __global__ void convolution_kernel_constant_vector(
 
 	if (x < width && y < height) {
 
-		// parallel computation of the 3 channels
+		// parallel computation of the 3 channels (no more channel loop)
 		float sum_r = 0.0f;
 		float sum_g = 0.0f;
 		float sum_b = 0.0f;
@@ -345,14 +378,14 @@ __global__ void convolution_kernel_constant_vector(
 
 				float filter_value = c_filter[(fy + FILTER_RADIUS) * FILTER_DIM + (fx + FILTER_RADIUS)];
 
-				// access .x .y .z fields of float4
+				// access .x .y .z fields of float4 to compute the convolution for each channel
 				sum_r += shared_tile[threadIdx.y + fy + FILTER_RADIUS][threadIdx.x + fx + FILTER_RADIUS].x * filter_value;
 				sum_g += shared_tile[threadIdx.y + fy + FILTER_RADIUS][threadIdx.x + fx + FILTER_RADIUS].y * filter_value;
 				sum_b += shared_tile[threadIdx.y + fy + FILTER_RADIUS][threadIdx.x + fx + FILTER_RADIUS].z * filter_value;
 			}
 		}
 
-		// optimized claming operations
+		// optimized clamping operations
 		sum_r = fminf(fmaxf(sum_r, 0.0f), 255.0f);
 		sum_g = fminf(fmaxf(sum_g, 0.0f), 255.0f);
 		sum_b = fminf(fmaxf(sum_b, 0.0f), 255.0f);
@@ -415,6 +448,7 @@ __global__ void convolution_kernel_optimized(
 		float sum_g = 0.0f;
 		float sum_b = 0.0f;
 
+		// loop unrolling
 #pragma unroll
 		for (int fy = -FILTER_RADIUS; fy <= FILTER_RADIUS; ++fy) {
 #pragma unroll
@@ -444,6 +478,8 @@ __global__ void convolution_kernel_optimized(
 // =====================================================================
 // UTILITIES
 // =====================================================================
+
+// validation function to compare each GPU output with the CPU output pixel-by-pixel given a tolerance value
 int validation(unsigned char* output_image_cpu, unsigned char* output_image_gpu, int width, int height, int tolerance) {
 	bool is_valid = true;
 	int total_pixels = width * height * RGBA_CHANNELS;
@@ -456,7 +492,7 @@ int validation(unsigned char* output_image_cpu, unsigned char* output_image_gpu,
 			std::cerr << "Validation failed at index " << i << ": CPU value = "
 				<< static_cast<int>(output_image_cpu[i]) << ", GPU value = "
 				<< static_cast<int>(output_image_gpu[i]) << ", difference = " << diff << std::endl;
-			// Stop after first few errors to avoid flooding console
+			// Stop after first error
 			break;
 		}
 	}
@@ -470,7 +506,7 @@ int validation(unsigned char* output_image_cpu, unsigned char* output_image_gpu,
 
 double get_throughput_mpixels(int width, int height, double time_ms) {
 	double time_sec = time_ms / 1000.0;
-	double total_pixels = static_cast<double>(width) * height;
+	double total_pixels = static_cast<double>(width) * height; // casting to guarantee the double type (second operand automatically promoted)
 
 	return (total_pixels / 1e6) / time_sec;
 }
@@ -496,13 +532,14 @@ int main(int argc, char** argv) {
 		return 1;
 	}
 
+	// Pointers usage for C lib compatibility and to avoid useless data copy
 	std::string filter_type = argv[1];
 	const char* input_image_path = argv[3];
 	const char* output_image_path = argv[4];
 
 	const float* active_filter = nullptr;
 
-	float blur_filter[FILTER_DIM * FILTER_DIM] = { 1.0f / 9.0f, 1.0f / 9.0f, 1.0f / 9.0f, 1.0f / 9.0f, 1.0f / 9.0f, 1.0f / 9.0f,	1.0f / 9.0f, 1.0f / 9.0f, 1.0f / 9.0f };
+	float blur_filter[FILTER_DIM * FILTER_DIM] = { 1.0f / 9.0f, 1.0f / 9.0f, 1.0f / 9.0f, 1.0f / 9.0f, 1.0f / 9.0f, 1.0f / 9.0f, 1.0f / 9.0f, 1.0f / 9.0f, 1.0f / 9.0f };
 	float edge_filter[FILTER_DIM * FILTER_DIM] = { -1.0f, -1.0f, -1.0f, -1.0f, 8.0f, -1.0f, -1.0f, -1.0f, -1.0f };
 	float sharpen_filter[FILTER_DIM * FILTER_DIM] = { 0.0f, -1.0f, 0.0f, -1.0f, 5.0f, -1.0f, 0.0f, -1.0f, 0.0f };
 
@@ -517,6 +554,8 @@ int main(int argc, char** argv) {
 	// ===================== LOADING IMAGE =====================
 	int width, height, input_channels;
 	unsigned char* input_image = stbi_load(input_image_path, &width, &height, &input_channels, RGBA_CHANNELS);
+	// 1D flattened array [R, G, B, A, R, G, B, A, ...] 
+	// unsigned char for pixel value = [0 - 255]
 
 	if (input_image == nullptr) {
 		std::cerr << "Error loading image: " << stbi_failure_reason() << std::endl;
@@ -529,12 +568,15 @@ int main(int argc, char** argv) {
 	std::cout << input_image_path << " Loaded: " << width << "x" << height << ", Channels: " << input_channels << " -> " << RGBA_CHANNELS << " (RGBA)" << std::endl;
 	std::cout << "================================================================\n" << std::endl;
 
+	// size_t for CUDA API compatibility
 	size_t image_size = width * height * RGBA_CHANNELS * sizeof(unsigned char);
 	size_t filter_size = FILTER_DIM * FILTER_DIM * sizeof(float);
 
+	// threads, blocks and grid
 	dim3 threadsPerBlock(BLOCK_SIZE, BLOCK_SIZE);
 	dim3 numBlocks((width + threadsPerBlock.x - 1) / threadsPerBlock.x, (height + threadsPerBlock.y - 1) / threadsPerBlock.y);
 
+	// cudaEvent to measure the execution time
 	cudaEvent_t start, stop;
 	CUDA_CHECK(cudaEventCreate(&start));
 	CUDA_CHECK(cudaEventCreate(&stop));
@@ -551,8 +593,7 @@ int main(int argc, char** argv) {
 	// ===================== CPU BASELINE =====================
 
 	std::cout << "SERIAL CONVOLUTION (CPU)" << std::endl;
-	// Warmup
-	convolution_cpu(input_image, output_image_cpu, width, height, active_filter);
+	convolution_cpu(input_image, output_image_cpu, width, height, active_filter); // one warm-up run
 
 	auto start_time_cpu = std::chrono::high_resolution_clock::now();
 	convolution_cpu(input_image, output_image_cpu, width, height, active_filter);
@@ -580,8 +621,7 @@ int main(int argc, char** argv) {
 		CUDA_CHECK(cudaMemcpy(d_input_image, input_image, image_size, cudaMemcpyHostToDevice));
 		CUDA_CHECK(cudaMemcpy(d_filter, active_filter, filter_size, cudaMemcpyHostToDevice));
 
-		// Warmup
-		convolution_kernel_naive << <numBlocks, threadsPerBlock >> > (d_input_image, d_output_image, width, height, d_filter);
+		convolution_kernel_naive << <numBlocks, threadsPerBlock >> > (d_input_image, d_output_image, width, height, d_filter); // one warm-up run
 		CUDA_CHECK(cudaGetLastError());
 		CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -700,13 +740,13 @@ int main(int argc, char** argv) {
 		CUDA_CHECK(cudaMemcpy(d_input_image, input_image, image_size, cudaMemcpyHostToDevice));
 		CUDA_CHECK(cudaMemcpyToSymbol(c_filter, active_filter, filter_size));
 
-		convolution_kernel_constant_vector << <numBlocks, threadsPerBlock >> > (d_input_image, d_output_image, width, height);
+		convolution_kernel_shared_constant_vector << <numBlocks, threadsPerBlock >> > (d_input_image, d_output_image, width, height);
 		CUDA_CHECK(cudaGetLastError());
 		CUDA_CHECK(cudaDeviceSynchronize());
 
 		CUDA_CHECK(cudaEventRecord(start));
 		for (int i = 0; i < iterations; ++i) {
-			convolution_kernel_constant_vector << <numBlocks, threadsPerBlock >> > (d_input_image, d_output_image, width, height);
+			convolution_kernel_shared_constant_vector << <numBlocks, threadsPerBlock >> > (d_input_image, d_output_image, width, height);
 		}
 		CUDA_CHECK(cudaEventRecord(stop));
 		CUDA_CHECK(cudaEventSynchronize(stop));
